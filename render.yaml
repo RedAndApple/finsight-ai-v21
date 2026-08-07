@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: finsight-ai
+    runtime: docker
+    plan: free
+    autoDeploy: false
+    envVars:
+      - key: AI_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_MODEL
+        value: openrouter/free
+      - key: AUTO_AI
+        value: "true"
+      - key: ENABLE_OCR
+        value: "true"
+      - key: OCR_LANGUAGE
+        value: rus+eng
+      - key: OCR_FORM_DPI_SCALE
+        value: "3.5"
+      - key: OCR_TEXT_DPI_SCALE
+        value: "2.8"
+      - key: OCR_MAX_PAGES
+        value: "0"
+      - key: PORT
+        value: "8000"

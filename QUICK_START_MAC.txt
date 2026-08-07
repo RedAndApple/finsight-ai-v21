@@ -1,0 +1,9 @@
+1. Распакуйте ZIP.
+2. Откройте Terminal.
+3. Выполните:
+
+cd ~/Downloads/FinSight_AI_FinUniversity_Brand_v2.1
+bash start_mac.command
+
+4. Откройте http://127.0.0.1:8000
+5. Для остановки нажмите Ctrl+C в Terminal.

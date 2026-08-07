@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="FinSight AI — ВКР-стартап Финансового университета для анализа финансовой отчетности с AI-агентом" />
+  <meta name="theme-color" content="#256569" />
+  <title>FinSight AI · Финансовый университет</title>
+  <link rel="icon" type="image/png" href="/assets/fu-mark.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css?v=2.1" />
+</head>
+<body>
+  <div id="toast" class="toast" hidden></div>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-university">
+          <img src="/assets/fu-logo-color.png" alt="Финансовый университет при Правительстве Российской Федерации" />
+        </div>
+        <div class="brand-product">
+          <span class="brand-mark">FS</span>
+          <div><strong>FinSight AI</strong><small>ВКР-СТАРТАП · 2026</small></div>
+        </div>
+      </div>
+      <nav>
+        <button data-view="home" class="nav-item active"><span>⌂</span>Обзор</button>
+        <button data-view="upload" class="nav-item"><span>＋</span>Новый анализ</button>
+        <button data-view="history" class="nav-item"><span>◷</span>История</button>
+        <button data-view="methodology" class="nav-item"><span>ƒ</span>Методология</button>
+        <button data-view="settings" class="nav-item"><span>⚙</span>Настройки</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div><span class="status-dot" id="apiDot"></span><span id="apiStatus">Проверка API…</span></div>
+        <small>Компетентность · Ответственность · Престиж</small>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <button class="menu-button" id="menuButton" aria-label="Открыть меню">☰</button>
+        <div class="topbar-title"><strong id="topTitle">Обзор</strong><span id="topSubtitle">ВКР-стартап Финансового университета</span></div>
+        <span class="top-badge" id="aiBadge">AI: проверка</span>
+      </header>
+      <div id="viewRoot"></div>
+      <footer>
+        <span>FinSight AI · учебный ВКР-стартап Финансового университета</span>
+        <span>Не является официальным сервисом университета, аудиторским заключением или инвестиционной рекомендацией.</span>
+      </footer>
+    </main>
+  </div>
+  <script src="/app.js?v=2.1" defer></script>
+</body>
+</html>

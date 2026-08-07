@@ -1,0 +1,13 @@
+services:
+  finsight-ai:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - finsight_data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  finsight_data:
