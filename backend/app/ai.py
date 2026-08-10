@@ -11,7 +11,7 @@ import httpx
 from .config import settings
 
 
-SYSTEM_PROMPT = """Ты — ведущий финансовый аналитик уровня Big Four с практикой анализа РСБУ, ФСБУ и МСФО.
+SYSTEM_PROMPT = """Ты — руководитель группы финансового анализа с практикой РСБУ, ФСБУ и МСФО.
 
 Твоя задача — превратить проверенную финансовую модель приложения в профессиональное аналитическое заключение для собственника, финансового директора или кредитного комитета.
 
@@ -20,12 +20,14 @@ SYSTEM_PROMPT = """Ты — ведущий финансовый аналитик
 2. Не используй сырой OCR-текст, внешние знания о компании и неподтвержденные причины.
 3. Не пересчитывай и не изменяй числа. Допускается объяснять экономический смысл и причинно-следственные связи между уже подтвержденными показателями.
 4. Для РСБУ анализируй отдельное юридическое лицо и явно не смешивай его с консолидированной Группой по МСФО.
+4а. Для кредитной организации по формам Банка России используй банковскую логику: ROA, ROE, Loan-to-Deposit, Cost-to-Income, резервирование и динамику процентных/комиссионных доходов. Не применяй Current Ratio, EBITDA, промышленную долговую нагрузку и маржу выручки.
 5. Не выдавай инвестиционных рекомендаций и не заменяй аудиторское заключение.
-6. Не пиши общие фразы вроде «нужно больше данных», если в JSON есть достаточные показатели. Вместо этого подробно анализируй доступную динамику, ликвидность, рентабельность, долговую нагрузку и денежные потоки.
-7. Executive summary должен содержать 5–7 законченных предложений: динамика выручки и прибыли, маржинальность, ликвидность, долговая нагрузка, денежные потоки и главный риск.
-8. В каждом из разделов strengths, weaknesses, risks, management_actions и strategic_observations дай 4–7 конкретных пунктов, если данные это позволяют.
-9. Каждый пункт — один аналитический вывод длиной до 45 слов. Не копируй таблицы и не повторяй один факт разными словами.
-10. Верни строго JSON без Markdown:
+6. Пиши как единый аналитический отчет, а не как перечень всех доступных цифр. Объединяй связанные метрики в один вывод и расставляй приоритеты по существенности.
+7. Executive summary — 5–7 связных предложений: масштаб и динамика бизнеса, маржинальность, ликвидность, финансовая устойчивость, качество прибыли и главный вывод.
+8. strengths, weaknesses, risks и management_actions — обычно по 3–5 приоритетных пунктов; strategic_observations — 2–4 синтезирующих вывода. Не добивай раздел общими фразами ради количества.
+9. Каждый пункт — вывод «факт → экономический смысл» до 55 слов. Не повторяй один и тот же факт в разных разделах.
+10. Для РСБУ не создавай ESG-выводы из бухгалтерских примечаний: укажи, что ESG не оценивается по данному источнику.
+11. Верни строго JSON без Markdown:
 {
   "executive_summary": "string",
   "strengths": ["string"],
@@ -65,7 +67,7 @@ def _provider_name() -> str:
     return host or "OpenAI-compatible API"
 
 
-async def compatible_chat(messages: list[dict[str, str]], max_tokens: int = 1800) -> dict[str, Any]:
+async def compatible_chat(messages: list[dict[str, Any]], max_tokens: int = 1800, model: str | None = None) -> dict[str, Any]:
     if not settings.ai_api_key:
         raise RuntimeError("AI_API_KEY не настроен")
 
@@ -75,25 +77,42 @@ async def compatible_chat(messages: list[dict[str, str]], max_tokens: int = 1800
         headers["HTTP-Referer"] = settings.ai_site_url
         headers["X-Title"] = settings.ai_app_name
 
-    payload = {
-        "model": settings.ai_model,
-        "messages": messages,
-        "temperature": 0.05,
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
-    }
+    requested_model = model or settings.ai_model
+    base_payload = {"model": requested_model, "messages": messages}
+    # New reasoning models use max_completion_tokens; a number of compatible
+    # gateways still implement only legacy max_tokens. Try both spellings and
+    # then fall back from JSON mode only for parameter-validation failures.
+    payloads = []
+    for token_key, json_mode in (
+        ("max_completion_tokens", True),
+        ("max_tokens", True),
+        ("max_completion_tokens", False),
+        ("max_tokens", False),
+    ):
+        candidate = {**base_payload, token_key: max_tokens}
+        if json_mode:
+            candidate["response_format"] = {"type": "json_object"}
+        payloads.append(candidate)
     endpoint = _chat_endpoint(settings.ai_base_url)
     async with httpx.AsyncClient(timeout=180) as client:
-        response = await client.post(endpoint, headers=headers, json=payload)
-        if response.status_code in {400, 422} and "response_format" in response.text.lower():
-            payload.pop("response_format", None)
+        response: httpx.Response | None = None
+        for payload in payloads:
             response = await client.post(endpoint, headers=headers, json=payload)
+            if response.is_success:
+                break
+            if response.status_code not in {400, 422}:
+                response.raise_for_status()
+        assert response is not None
         response.raise_for_status()
         data = response.json()
 
     content = data["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        content = "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Модель не вернула текст анализа")
     parsed = _extract_json(content)
-    parsed["model"] = data.get("model", settings.ai_model)
+    parsed["model"] = data.get("model", requested_model)
     parsed["provider"] = _provider_name()
     parsed["usage"] = data.get("usage", {})
     return parsed
@@ -112,9 +131,10 @@ def _metric_payload(financial_metrics: Any) -> list[dict[str, Any]]:
     """
     values = financial_metrics.values() if isinstance(financial_metrics, dict) else financial_metrics or []
     trusted_sources = {
-        "verified_demo_rsbu", "verified_demo", "ras_coordinate_ocr",
+        "bank_ras_coordinate_ocr", "ras_coordinate_ocr", "ras_form",
         "spreadsheet", "spreadsheet_table", "pdf_table",
-        "derived_from_verified_rows",
+        "derived_from_verified_rows", "reconciled_from_accounting_identity",
+        "ai_vision_recovery", "docx_table",
     }
     output = []
     for item in values:
@@ -190,12 +210,12 @@ def _clean_narrative_items(items: list[dict[str, Any]] | None, max_items: int = 
 
 def _ratio_groups(ratios: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     groups = {
-        "liquidity": {"current_ratio", "quick_ratio", "cash_ratio", "working_capital", "ocf_ratio"},
-        "profitability": {"gross_margin", "operating_margin", "net_margin", "ebitda_margin", "roa", "roe"},
+        "liquidity": {"current_ratio", "quick_ratio", "cash_ratio", "working_capital", "ocf_ratio", "bank_loan_to_deposit"},
+        "profitability": {"gross_margin", "operating_margin", "net_margin", "ebitda_margin", "roa", "roe", "bank_net_interest_income_to_assets"},
         "leverage": {"debt_ratio", "debt_equity", "equity_ratio", "net_debt", "net_debt_equity", "interest_coverage"},
-        "efficiency": {"asset_turnover", "inventory_turnover", "receivables_turnover"},
+        "efficiency": {"asset_turnover", "inventory_turnover", "receivables_turnover", "bank_cost_to_income", "bank_credit_loss_to_loans"},
         "cash_flow": {"free_cash_flow", "ocf_margin", "cash_conversion"},
-        "growth": {"revenue_growth", "net_profit_growth"},
+        "growth": {"revenue_growth", "net_profit_growth", "bank_net_interest_income_growth", "bank_fee_income_growth"},
     }
     output: dict[str, list[dict[str, Any]]] = {key: [] for key in groups}
     for item in ratios or []:
@@ -214,10 +234,21 @@ def _ratio_groups(ratios: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
     return output
 
 
+def _is_ras_result(result: dict[str, Any]) -> bool:
+    metadata = result.get("metadata", {})
+    descriptor = " ".join(str(metadata.get(key) or "") for key in (
+        "document_type", "accounting_standard", "reporting_standard", "filename",
+    )).lower()
+    financial_metrics = result.get("financial_metrics") or {}
+    values = financial_metrics.values() if isinstance(financial_metrics, dict) else financial_metrics
+    coded_rows = sum(1 for item in values if isinstance(item, dict) and item.get("row_code"))
+    return metadata.get("document_type") in {"ras_financial_statements", "bank_ras_financial_statements"} or "рсбу" in descriptor or "рпбу" in descriptor or coded_rows >= 8
+
+
 def _structured_payload(result: dict[str, Any]) -> dict[str, Any]:
     metadata = result.get("metadata", {})
     narrative = result.get("narrative", {})
-    is_ras = metadata.get("document_type") == "ras_financial_statements"
+    is_ras = _is_ras_result(result)
     metrics = _metric_payload(result.get("financial_metrics"))
     available_ratios = [item for item in result.get("ratios", []) if item.get("status") != "na"]
     payload = {
@@ -229,7 +260,13 @@ def _structured_payload(result: dict[str, Any]) -> dict[str, Any]:
             "reporting_scope": metadata.get("reporting_scope"),
             "currency_or_unit": metadata.get("unit") or metadata.get("currency"),
             "audit_opinion": metadata.get("audit_opinion"),
-            "important_rule": "Это отдельная отчетность юридического лица по РСБУ; выводы о консолидированной Группе запрещены." if is_ras else None,
+            "financial_institution_profile": metadata.get("financial_institution_profile"),
+            "statement_form_codes": metadata.get("statement_form_codes"),
+            "important_rule": (
+                "Это отдельная отчетность кредитной организации по формам Банка России; применяй только банковские коэффициенты и не используй промышленную логику ликвидности/EBITDA."
+                if metadata.get("financial_institution_profile") == "credit_organization"
+                else ("Это отдельная отчетность юридического лица по РСБУ; выводы о консолидированной Группе запрещены." if is_ras else None)
+            ),
         },
         "coverage": {
             "verified_metrics_count": len(metrics),
@@ -280,11 +317,35 @@ def _validate_numbers(text: str, allowed: set[str]) -> bool:
     return True
 
 
+def _analysis_item_text(item: Any) -> str:
+    """Flatten a structured model bullet without leaking JSON/Python syntax."""
+    if isinstance(item, str):
+        return re.sub(r"\s+", " ", item).strip(" •-\t")
+    if not isinstance(item, dict):
+        return ""
+    priority = (
+        "action", "recommendation", "text", "finding", "insight",
+        "description", "observation", "risk", "limitation", "title",
+    )
+    selected: list[str] = []
+    for key in priority:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            text = re.sub(r"\s+", " ", value).strip(" •-\t")
+            if text and text not in selected:
+                selected.append(text)
+        # The action itself is complete in the structured schema used by the
+        # professional report. IDs and linkage fields are intentionally omitted.
+        if key in {"action", "recommendation", "text"} and selected:
+            break
+    return ": ".join(selected[:2])
+
+
 def _merge_unique(primary: list[str], baseline: list[str], limit: int = 8) -> list[str]:
     output: list[str] = []
     seen: set[str] = set()
     for item in [*primary, *baseline]:
-        text = re.sub(r"\s+", " ", str(item)).strip(" •-\t")
+        text = _analysis_item_text(item)
         key = re.sub(r"[^а-яa-z0-9]+", " ", text.lower().replace("ё", "е")).strip()
         if not text or key in seen:
             continue
@@ -311,25 +372,23 @@ def _sanitize_analysis(data: dict[str, Any], result: dict[str, Any]) -> dict[str
 
     cleaned: dict[str, Any] = {"executive_summary": summary}
     minimums = {
-        "strengths": 4, "weaknesses": 4, "risks": 3,
-        "management_actions": 4, "strategic_observations": 3,
+        "strengths": 3, "weaknesses": 2, "risks": 2,
+        "management_actions": 3, "strategic_observations": 2,
         "data_limitations": 1, "esg_observations": 1,
     }
     for field in fields:
         raw = data.get(field, []) if isinstance(data.get(field, []), list) else []
         valid: list[str] = []
         for item in raw:
-            text = re.sub(r"\s+", " ", str(item)).strip(" •-\t")
+            text = _analysis_item_text(item)
             if not _is_gibberish(text) and _validate_numbers(text, allowed_numbers):
                 valid.append(text)
-        merged = _merge_unique(valid, baseline.get(field, []) if isinstance(baseline.get(field), list) else [], 8)
-        # Never let an external model make the report less substantial than the
-        # deterministic financial model.
-        if len(merged) < minimums[field]:
-            merged = _merge_unique(baseline.get(field, []) if isinstance(baseline.get(field), list) else [], valid, 8)
-        cleaned[field] = merged
+        baseline_items = baseline.get(field, []) if isinstance(baseline.get(field), list) else []
+        # Use one authorial voice. Mixing model prose with every baseline bullet
+        # made the report repetitive even when the model returned a good answer.
+        cleaned[field] = _merge_unique(valid, [], 5) if len(valid) >= minimums[field] else _merge_unique(baseline_items, [], 5)
 
-    is_ras = result.get("metadata", {}).get("document_type") == "ras_financial_statements"
+    is_ras = _is_ras_result(result)
     if is_ras and not cleaned["esg_observations"]:
         cleaned["esg_observations"] = [
             "В бухгалтерской отчетности по РСБУ отсутствует достаточный набор ESG-метрик; для ESG-анализа требуется годовой отчет или отчет об устойчивом развитии."
@@ -338,7 +397,7 @@ def _sanitize_analysis(data: dict[str, Any], result: dict[str, Any]) -> dict[str
     cleaned["model"] = data.get("model", settings.ai_model)
     cleaned["provider"] = data.get("provider", _provider_name())
     cleaned["usage"] = data.get("usage", {})
-    cleaned["mode"] = "ai_financial_model_v21"
+    cleaned["mode"] = "ai_financial_model_v31"
     cleaned["chunks_processed"] = 0
     cleaned["coverage"] = baseline.get("coverage", {})
     return cleaned
@@ -355,8 +414,8 @@ async def map_reduce_analysis(result: dict[str, Any]) -> dict[str, Any]:
     prompt = {
         "task": (
             "Подготовь профессиональное финансово-аналитическое заключение. "
-            "Используй deterministic_baseline как обязательный минимальный набор выводов, "
-            "а ratio_groups_calculated_by_code — для углубления анализа ликвидности, рентабельности, долговой нагрузки, эффективности и денежных потоков."
+            "Используй deterministic_baseline как контрольный набор фактов, но не копируй его построчно. "
+            "Синтезируй ratio_groups_calculated_by_code в несколько приоритетных выводов о динамике, маржинальности, ликвидности, финансовой устойчивости и денежных потоках."
         ),
         "required_logic": [
             "Сопоставь рост выручки, валовой прибыли, прибыли от продаж и чистой прибыли; объясни только наблюдаемое расхождение, не придумывая причины.",
@@ -364,7 +423,7 @@ async def map_reduce_analysis(result: dict[str, Any]) -> dict[str, Any]:
             "Оцени финансовую устойчивость по Debt/Equity, Debt Ratio, Equity Ratio, Net Debt и Interest Coverage.",
             "Оцени качество прибыли по операционному денежному потоку, Cash Conversion и Free Cash Flow.",
             "Сформулируй конкретные действия менеджмента, связанные с выявленными показателями и риск-флагами.",
-            "Не сокращай разделы до одной общей фразы."
+            "Удали дубли: один факт должен появляться в отчете один раз, а каждое действие должно отвечать на конкретный вывод."
         ],
         "hard_constraints": [
             "Использовать только проверенные данные JSON и deterministic_baseline.",
@@ -382,17 +441,22 @@ async def map_reduce_analysis(result: dict[str, Any]) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            raw = await compatible_chat(messages, max_tokens=3600)
+            # Reasoning-model token limits include internal reasoning on some
+            # providers, so leave enough room for both analysis and JSON output.
+            raw = await compatible_chat(messages, max_tokens=6000)
             return _sanitize_analysis(raw, result)
+        except httpx.HTTPError:
+            # Authentication, billing and gateway availability errors will not
+            # improve by immediately submitting the same paid request again.
+            raise
         except Exception as exc:
             last_error = exc
             messages.append({
                 "role": "user",
                 "content": (
                     "Ответ отклонен валидатором. Сохрани все существенные выводы deterministic_baseline, "
-                    "сделай executive_summary не короче пяти предложений и заполни каждый аналитический раздел. "
+                    "сделай executive_summary не короче пяти предложений, оставь только существенные выводы и не дублируй цифры между разделами. "
                     f"Причина: {type(exc).__name__}."
                 ),
             })
     raise ValueError(f"AI не прошел проверку качества: {last_error}")
-

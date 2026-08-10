@@ -2,121 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import hashlib
 import io
-import re
+import logging
 import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import fitz
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .analysis import fallback_analysis, process_document, run_ai_for_result
-from .demo_rsbu import build_rsbu_demo_result
+from .analysis import _company_from_filename, _is_ras_result, fallback_analysis, process_document, run_ai_for_result
 from .config import FRONTEND_DIST, RESULT_DIR, SAMPLE_DIR, UPLOAD_DIR, settings
 from .financial import build_risk_flags, calculate_ratios, parse_number, score_analysis
+from .canonical import canonicalize_metrics
+from .validation import validate_model
+from .trends import calculate_trends
 from .store import store
+from .exports import build_docx, build_pdf, build_xlsx
 
-ALLOWED_SUFFIXES = {".pdf", ".xlsx", ".xls", ".csv"}
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def looks_like_verified_lukoil_rsbu(path: Path, original_name: str) -> bool:
-    """Fast pre-OCR identification of the diploma demo report.
-
-    The official file may be re-saved by a browser or PDF editor, changing its
-    hash. The filename markers plus the exact 78-page structure are specific
-    enough for the bundled university demonstration and avoid a long, noisy OCR
-    pass before the verified model is used.
-    """
-    normalized = re.sub(r"[^а-яa-z0-9]+", " ", original_name.lower().replace("ё", "е"))
-    has_name = ("лукойл" in normalized or "lukoil" in normalized) and ("рсбу" in normalized or "бфо" in normalized) and "2025" in normalized
-    if not has_name:
-        return False
-    try:
-        with fitz.open(path) as doc:
-            return doc.page_count == 78
-    except Exception:
-        return False
-
-
-def create_verified_rsbu_record(
-    document_id: str,
-    stored_path: Path,
-    original_name: str,
-    mime_type: str | None = "application/pdf",
-    *,
-    wait_for_ai: bool = False,
-) -> dict[str, Any]:
-    """Create the pre-verified RAS demo record.
-
-    When AI is configured the record remains in ``processing`` state until the
-    model has edited the deterministic, fact-checked baseline. This prevents
-    the UI from briefly showing a weaker fallback and then requiring a second
-    button press.
-    """
-    result_path = RESULT_DIR / f"{document_id}.json"
-    result = build_rsbu_demo_result(document_id, original_name)
-    store.write_result(result_path, result)
-    ai_pending = bool(wait_for_ai and settings.auto_ai and settings.ai_api_key)
-    return store.create(
-        {
-            "id": document_id,
-            "original_name": original_name,
-            "stored_path": str(stored_path),
-            "mime_type": mime_type or "application/pdf",
-            "size_bytes": stored_path.stat().st_size,
-            "company": result["metadata"]["company"],
-            "document_type": "ras_financial_statements",
-            "reporting_year": 2025,
-            "status": "processing" if ai_pending else "completed",
-            "progress": 88 if ai_pending else 100,
-            "stage": "AI формирует итоговое проверенное заключение" if ai_pending else "Проверенное демо РСБУ готово",
-            "result_path": str(result_path),
-            "ai_status": "processing" if ai_pending else result["analysis"].get("mode", "verified_rsbu_demo_fallback"),
-        }
-    )
-
-
-def schedule_verified_ai(document_id: str) -> None:
-    """Finish a pre-verified demo with AI before exposing it as completed."""
-    def runner() -> None:
-        try:
-            asyncio.run(run_ai_for_result(document_id))
-            store.update(
-                document_id, status="completed", progress=100,
-                stage="Проверенный AI-анализ завершен", error=None,
-            )
-        except Exception as exc:
-            # The deterministic baseline remains factually valid and is shown
-            # only if the external model is unavailable or fails validation.
-            store.update(
-                document_id, status="completed", progress=100,
-                stage="Анализ завершен с проверенным резервным заключением",
-                ai_status="deterministic_verified", error=None,
-            )
-            record = store.get(document_id)
-            if record and record.get("result_path"):
-                result = store.read_result(record["result_path"])
-                result.setdefault("analysis", {})["ai_error"] = str(exc)
-                store.write_result(Path(record["result_path"]), result)
-
-    executor.submit(runner)
-
+ALLOWED_SUFFIXES = {".pdf", ".xlsx", ".xls", ".csv", ".docx", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("finsight.api")
 
 
 class FinancialMetricsUpdate(BaseModel):
@@ -126,7 +37,7 @@ executor = ThreadPoolExecutor(max_workers=2)
 
 app = FastAPI(
     title="FinSight AI API",
-    version="2.1.0",
+    version="3.4.1",
     description="Автоматический анализ финансовой отчетности и годовых отчетов.",
 )
 app.add_middleware(
@@ -149,12 +60,21 @@ def public_record(record: dict[str, Any]) -> dict[str, Any]:
 def schedule_processing(document_id: str, path: Path) -> None:
     def progress(value: int, stage: str) -> None:
         store.update(document_id, status="processing", progress=max(0, min(99, value)), stage=stage)
+        logger.info("analysis_progress document_id=%s progress=%s stage=%s", document_id, value, stage)
 
     def runner() -> None:
         try:
+            logger.info("analysis_started document_id=%s suffix=%s size_bytes=%s", document_id, path.suffix.lower(), path.stat().st_size if path.exists() else None)
             store.update(document_id, status="processing", progress=1, stage="Запуск анализатора", error=None)
-            process_document(document_id, path, progress)
+            result = process_document(document_id, path, progress)
+            logger.info(
+                "analysis_completed document_id=%s metrics=%s ratios=%s validation=%s",
+                document_id, len(result.get("financial_metrics", {})),
+                sum(item.get("status") != "na" for item in result.get("ratios", [])),
+                result.get("validation", {}).get("status"),
+            )
         except Exception as exc:
+            logger.exception("analysis_failed document_id=%s", document_id)
             store.update(document_id, status="error", stage="Ошибка анализа", error=str(exc), progress=100)
 
     executor.submit(runner)
@@ -164,6 +84,7 @@ def schedule_processing(document_id: str, path: Path) -> None:
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
+        "version": "3.4.1",
         "ai_configured": bool(settings.ai_api_key),
         "openrouter_configured": bool(settings.ai_api_key),
         "ai_base_url": settings.ai_base_url,
@@ -175,10 +96,16 @@ def health() -> dict[str, Any]:
         "ocr_text_dpi_scale": settings.ocr_text_dpi_scale,
         "ocr_max_pages": settings.ocr_max_pages,
         "auto_ai": settings.auto_ai,
+        "vision_recovery_enabled": settings.enable_vision_recovery,
+        "vision_model": settings.vision_model,
+        "vision_max_pages": settings.vision_max_pages,
+        "vision_locator_max_pages": settings.vision_locator_max_pages,
+        "vision_contact_sheet_pages": settings.vision_contact_sheet_pages,
+        "ocr_retry_dpi_scale": settings.ocr_retry_dpi_scale,
         "max_upload_mb": settings.max_upload_mb,
         "model": settings.ai_model,
-        "ocr_engine": "Tesseract multi-pass + official RAS code/coordinate parser",
-        "analysis_pipeline": "full financial model → 24+ ratios → deterministic report → automatic AI editor",
+        "ocr_engine": "page-adaptive Tesseract multi-pass + visual statement locator + RAS/IFRS/Bank of Russia primary forms",
+        "analysis_pipeline": "adaptive parser → canonical model → reconciliation/validation → ratios/trends → validated AI",
         "supported_formats": sorted(ALLOWED_SUFFIXES),
     }
 
@@ -192,7 +119,7 @@ async def upload_document(
     original_name = file.filename or "document"
     suffix = Path(original_name).suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
-        raise HTTPException(status_code=400, detail="Поддерживаются PDF, XLSX, XLS и CSV.")
+        raise HTTPException(status_code=400, detail="Поддерживаются PDF, DOCX, XLSX, XLS, CSV и изображения PNG/JPEG/TIFF/BMP/WebP.")
 
     document_id = str(uuid.uuid4())
     stored_path = UPLOAD_DIR / f"{document_id}{suffix}"
@@ -205,17 +132,6 @@ async def upload_document(
                 stored_path.unlink(missing_ok=True)
                 raise HTTPException(status_code=413, detail=f"Максимальный размер файла — {settings.max_upload_mb} МБ.")
             target.write(chunk)
-
-    sample_path = SAMPLE_DIR / "lukoil_rsbu_2025.pdf"
-    exact_demo = suffix == ".pdf" and sample_path.exists() and sha256_file(stored_path) == sha256_file(sample_path)
-    recognized_demo = suffix == ".pdf" and looks_like_verified_lukoil_rsbu(stored_path, original_name)
-    if exact_demo or recognized_demo:
-        record = create_verified_rsbu_record(
-            document_id, stored_path, original_name, file.content_type, wait_for_ai=True
-        )
-        if record["status"] == "processing":
-            schedule_verified_ai(document_id)
-        return public_record(record)
 
     record = store.create(
         {
@@ -233,7 +149,7 @@ async def upload_document(
 
 @app.post("/api/documents/demo", status_code=201)
 def create_demo() -> dict[str, Any]:
-    """Create an instant, pre-verified RAS demo from the bundled scanned PDF."""
+    """Run the bundled RAS report through the universal upload pipeline."""
     sample_path = SAMPLE_DIR / "lukoil_rsbu_2025.pdf"
     if not sample_path.exists():
         raise HTTPException(status_code=404, detail="Демонстрационный PDF РСБУ отсутствует в сборке.")
@@ -241,9 +157,11 @@ def create_demo() -> dict[str, Any]:
     stored_path = UPLOAD_DIR / f"{document_id}.pdf"
     shutil.copy2(sample_path, stored_path)
     original_name = "БФО ПАО ЛУКОЙЛ РСБУ 2025.pdf"
-    record = create_verified_rsbu_record(document_id, stored_path, original_name, wait_for_ai=True)
-    if record["status"] == "processing":
-        schedule_verified_ai(document_id)
+    record = store.create({
+        "id": document_id, "original_name": original_name, "stored_path": str(stored_path),
+        "mime_type": "application/pdf", "size_bytes": stored_path.stat().st_size,
+    })
+    schedule_processing(document_id, stored_path)
     return public_record(record)
 
 
@@ -277,7 +195,28 @@ def get_result(document_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=record.get("error") or "Ошибка анализа")
     if record["status"] != "completed" or not record.get("result_path"):
         raise HTTPException(status_code=409, detail="Анализ еще не завершен")
-    return store.read_result(record["result_path"])
+    result = store.read_result(record["result_path"])
+    changed = False
+    metadata = result.setdefault("metadata", {})
+    if _is_ras_result(result):
+        if metadata.get("document_type") != "ras_financial_statements":
+            metadata["document_type"] = "ras_financial_statements"
+            changed = True
+        if metadata.get("accounting_standard") != "РСБУ":
+            metadata["accounting_standard"] = "РСБУ"
+            metadata["reporting_scope"] = "Отдельное юридическое лицо"
+            changed = True
+    filename_company = _company_from_filename(metadata.get("filename"))
+    if filename_company and str(metadata.get("company", "")).lower() in {"не определено", "ао «кэпт»"}:
+        metadata["company"] = filename_company
+        changed = True
+    analysis_mode = str(result.get("analysis", {}).get("mode", ""))
+    if analysis_mode.startswith("deterministic_") and analysis_mode != "deterministic_financial_model_v31":
+        result["analysis"] = fallback_analysis(result)
+        changed = True
+    if changed:
+        store.write_result(Path(record["result_path"]), result)
+    return result
 
 
 @app.post("/api/documents/{document_id}/reanalyze", status_code=202)
@@ -314,8 +253,14 @@ def update_financial_metrics(document_id: str, payload: FinancialMetricsUpdate) 
             "confidence": item.get("confidence", 1.0),
             "manually_verified": True,
         }
-    result["financial_metrics"] = normalized
-    result["ratios"] = calculate_ratios(normalized)
+    canonical = canonicalize_metrics(normalized)
+    validation = validate_model(canonical)
+    valid = validation.pop("valid_metrics")
+    result["canonical_financial_model"] = canonical
+    result["validation"] = validation
+    result["financial_metrics"] = valid
+    result["ratios"] = calculate_ratios(valid)
+    result["trends"] = calculate_trends(valid)
     source_text = "\n".join(page.get("text", "") for page in result.get("source", {}).get("pages", []))
     result["risk_flags"] = build_risk_flags(
         normalized, result["ratios"], source_text, result.get("source", {}).get("pages", [])
@@ -389,6 +334,40 @@ def export_json(document_id: str) -> FileResponse:
     if not record or not record.get("result_path"):
         raise HTTPException(status_code=404, detail="Результат не найден")
     return FileResponse(record["result_path"], filename=f"finsight-{document_id}.json", media_type="application/json")
+
+
+def _result_for_export(document_id: str) -> dict[str, Any]:
+    record = store.get(document_id)
+    if not record or not record.get("result_path"):
+        raise HTTPException(status_code=404, detail="Результат не найден")
+    return store.read_result(record["result_path"])
+
+
+@app.get("/api/documents/{document_id}/export.xlsx")
+def export_xlsx(document_id: str) -> Response:
+    return Response(
+        content=build_xlsx(_result_for_export(document_id)),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="finsight-report-{document_id}.xlsx"'},
+    )
+
+
+@app.get("/api/documents/{document_id}/export.docx")
+def export_docx(document_id: str) -> Response:
+    return Response(
+        content=build_docx(_result_for_export(document_id)),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="finsight-report-{document_id}.docx"'},
+    )
+
+
+@app.get("/api/documents/{document_id}/export.pdf")
+def export_pdf(document_id: str) -> Response:
+    return Response(
+        content=build_pdf(_result_for_export(document_id)),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="finsight-report-{document_id}.pdf"'},
+    )
 
 
 if FRONTEND_DIST.exists():

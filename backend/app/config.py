@@ -41,6 +41,15 @@ class Settings:
     ai_auth_header: str = os.getenv("AI_AUTH_HEADER", "Authorization").strip() or "Authorization"
     ai_auth_scheme: str = os.getenv("AI_AUTH_SCHEME", "Bearer").strip()
     auto_ai: bool = _env_bool("AUTO_AI")
+    enable_vision_recovery: bool = _env_bool("ENABLE_VISION_RECOVERY", "true")
+    vision_model: str = _first_env("VISION_MODEL", "AI_MODEL", "OPENROUTER_MODEL", default="openrouter/free")
+    # High-resolution visual transcription is limited to the pages that a
+    # local/visual locator identifies as primary statements.  Twelve pages are
+    # enough for multi-page balance/P&L/cash-flow forms without silently
+    # truncating a statement split across several sheets.
+    vision_max_pages: int = int(os.getenv("VISION_MAX_PAGES", "12"))
+    vision_locator_max_pages: int = int(os.getenv("VISION_LOCATOR_MAX_PAGES", "180"))
+    vision_contact_sheet_pages: int = int(os.getenv("VISION_CONTACT_SHEET_PAGES", "12"))
 
     # Backward-compatible aliases used by older code/UI.
     @property
@@ -64,9 +73,15 @@ class Settings:
     ocr_language: str = os.getenv("OCR_LANGUAGE", "rus+eng")
     # Scan OCR quality settings. Scale 3.4 is roughly 245 dpi for PDF rendering.
     ocr_dpi_scale: float = float(os.getenv("OCR_DPI_SCALE", "3.0"))
-    ocr_form_dpi_scale: float = float(os.getenv("OCR_FORM_DPI_SCALE", "3.5"))
+    ocr_form_dpi_scale: float = float(os.getenv("OCR_FORM_DPI_SCALE", "3.2"))
     ocr_text_dpi_scale: float = float(os.getenv("OCR_TEXT_DPI_SCALE", "2.8"))
+    ocr_retry_dpi_scale: float = float(os.getenv("OCR_RETRY_DPI_SCALE", "3.8"))
     ocr_primary_form_pages: int = int(os.getenv("OCR_PRIMARY_FORM_PAGES", "14"))
+    # Financial statements are frequently placed after the auditor's report or
+    # at the end of a 50-150 page annual report.  A low default limit silently
+    # skipped exactly those pages, leaving the canonical model empty.  Zero is
+    # intentional: every image-only page is inspected unless an operator opts
+    # into a limit explicitly.
     ocr_max_pages: int = int(os.getenv("OCR_MAX_PAGES", "0"))  # 0 = all pages
     ocr_min_text_chars: int = int(os.getenv("OCR_MIN_TEXT_CHARS", "80"))
     ocr_quality_warning: float = float(os.getenv("OCR_QUALITY_WARNING", "62"))

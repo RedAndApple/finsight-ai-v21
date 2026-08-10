@@ -2,7 +2,7 @@
 2. Откройте Terminal.
 3. Выполните:
 
-cd ~/Downloads/FinSight_AI_FinUniversity_Brand_v2.1
+cd ~/Downloads/FinSight_AI_v3.4.1_Banking_Universal
 bash start_mac.command
 
 4. Откройте http://127.0.0.1:8000

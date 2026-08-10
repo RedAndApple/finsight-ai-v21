@@ -24,7 +24,7 @@ fi
 if command -v tesseract >/dev/null 2>&1; then
   echo "OCR: $(command -v tesseract)"
 else
-  echo "Предупреждение: Tesseract не найден. Демо ЛУКОЙЛ работает по проверенному профилю; для других сканов установите:"
+  echo "Предупреждение: Tesseract не найден. Для PDF-сканов установите OCR:"
   echo "  brew install tesseract tesseract-lang"
 fi
 
@@ -37,7 +37,7 @@ python -m pip install --disable-pip-version-check -r backend/requirements.txt
 PORT_VALUE="$(grep -E '^PORT=' .env | tail -1 | cut -d= -f2 | tr -d '[:space:]' || true)"
 PORT_VALUE="${PORT_VALUE:-8000}"
 echo ""
-echo "FinSight AI v2.1 запускается: http://127.0.0.1:${PORT_VALUE}"
+echo "FinSight AI v3.4.1 запускается: http://127.0.0.1:${PORT_VALUE}"
 echo "Оставьте это окно терминала открытым. Остановка: Ctrl+C"
 echo ""
 cd backend

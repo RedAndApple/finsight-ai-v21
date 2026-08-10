@@ -12,6 +12,7 @@ FINANCIAL_SYNONYMS: dict[str, list[str]] = {
     "gross_profit": ["валовая прибыль", "gross profit"],
     "operating_profit": ["операционная прибыль", "прибыль от операционной деятельности", "operating profit", "ebit"],
     "ebitda": ["ebitda", "скорректированная ebitda"],
+    "depreciation_amortization": ["амортизация", "depreciation and amortization", "depreciation"],
     "net_profit": ["чистая прибыль", "прибыль за год", "net profit", "net income", "profit for the year"],
     "cash": ["денежные средства и их эквиваленты", "денежные средства", "cash and cash equivalents", "cash"],
     "receivables": ["дебиторская задолженность", "trade receivables", "accounts receivable", "receivables"],
@@ -45,6 +46,21 @@ FINANCIAL_SYNONYMS: dict[str, list[str]] = {
     "net_cash_change": ["сальдо денежных потоков за период", "net change in cash"],
     "cash_begin": ["остаток денежных средств на начало периода", "cash at beginning"],
     "cash_end": ["остаток денежных средств на конец периода", "cash at end"],
+    # Bank of Russia public forms 0409806/0409807. These keys deliberately do
+    # not masquerade as industrial revenue, working capital or EBITDA rows.
+    "bank_central_bank_funds": ["средства в банке россии"],
+    "bank_interbank_assets": ["средства в кредитных организациях"],
+    "bank_customer_loans": ["чистая ссудная задолженность"],
+    "bank_customer_funds": ["средства клиентов"],
+    "bank_interest_income": ["процентные доходы банка"],
+    "bank_interest_expense": ["процентные расходы банка"],
+    "bank_net_interest_income": ["чистые процентные доходы банка"],
+    "bank_credit_loss_charge": ["изменение резервов под кредитные убытки"],
+    "bank_net_interest_income_after_provisions": ["чистые процентные доходы после резервов"],
+    "bank_fee_income": ["комиссионные доходы"],
+    "bank_fee_expense": ["комиссионные расходы"],
+    "bank_net_operating_income": ["чистые операционные доходы банка"],
+    "bank_operating_expenses": ["операционные расходы банка"],
 }
 
 DISPLAY_NAMES = {
@@ -53,6 +69,7 @@ DISPLAY_NAMES = {
     "gross_profit": "Валовая прибыль",
     "operating_profit": "Операционная прибыль",
     "ebitda": "EBITDA",
+    "depreciation_amortization": "Амортизация",
     "net_profit": "Чистая прибыль",
     "cash": "Денежные средства",
     "receivables": "Дебиторская задолженность",
@@ -88,6 +105,19 @@ DISPLAY_NAMES = {
     "net_cash_change": "Изменение денежных средств за период",
     "cash_begin": "Денежные средства на начало периода",
     "cash_end": "Денежные средства на конец периода",
+    "bank_central_bank_funds": "Средства в Банке России",
+    "bank_interbank_assets": "Средства в кредитных организациях",
+    "bank_customer_loans": "Чистая ссудная задолженность",
+    "bank_customer_funds": "Средства клиентов",
+    "bank_interest_income": "Процентные доходы",
+    "bank_interest_expense": "Процентные расходы",
+    "bank_net_interest_income": "Чистые процентные доходы",
+    "bank_credit_loss_charge": "Изменение резервов под кредитные убытки",
+    "bank_net_interest_income_after_provisions": "Чистые процентные доходы после резервов",
+    "bank_fee_income": "Комиссионные доходы",
+    "bank_fee_expense": "Комиссионные расходы",
+    "bank_net_operating_income": "Чистые операционные доходы",
+    "bank_operating_expenses": "Операционные расходы",
 }
 
 OPERATIONAL_CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
@@ -215,6 +245,49 @@ def calculate_ratios(financial_metrics: dict[str, dict[str, Any]]) -> list[dict[
 
     def add(key: str, name: str, value: float | None, formula: str, status: str, explanation: str) -> None:
         ratio_definitions.append((key, name, value, formula, status, explanation))
+
+    is_bank = any(key.startswith("bank_") for key in financial_metrics)
+    if is_bank:
+        roa = safe_divide(c["net_profit"], average(c["assets"], p["assets"]))
+        add("roa", "ROA", roa, "Чистая прибыль / Средние активы", metric_status(roa, lambda x: x >= 0.015, lambda x: x >= 0.007), "Рентабельность активов кредитной организации")
+        roe = safe_divide(c["net_profit"], average(c["equity"], p["equity"]))
+        add("roe", "ROE", roe, "Чистая прибыль / Средние собственные средства", metric_status(roe, lambda x: x >= 0.15, lambda x: x >= 0.08), "Рентабельность собственных средств кредитной организации")
+        equity_ratio = safe_divide(c["equity"], c["assets"])
+        add("equity_ratio", "Equity / Assets", equity_ratio, "Собственные средства / Активы", metric_status(equity_ratio, lambda x: x >= 0.10, lambda x: x >= 0.07), "Балансовый запас собственного финансирования; не заменяет норматив достаточности капитала")
+        loan_to_deposit = safe_divide(c["bank_customer_loans"], c["bank_customer_funds"])
+        add("bank_loan_to_deposit", "Loan-to-Deposit", loan_to_deposit, "Чистая ссудная задолженность / Средства клиентов", metric_status(loan_to_deposit, lambda x: 0.70 <= x <= 0.95, lambda x: 0.55 <= x <= 1.10), "Соотношение кредитного портфеля и клиентского фондирования")
+        cost_to_income = safe_divide(abs(c["bank_operating_expenses"]) if c["bank_operating_expenses"] is not None else None, c["bank_net_operating_income"])
+        add("bank_cost_to_income", "Cost-to-Income", cost_to_income, "Операционные расходы / Чистые операционные доходы", metric_status(cost_to_income, lambda x: x <= 0.45, lambda x: x <= 0.60), "Операционная эффективность банка: чем ниже, тем лучше")
+        credit_loss_to_loans = safe_divide(
+            abs(c["bank_credit_loss_charge"]) if c["bank_credit_loss_charge"] is not None else None,
+            average(c["bank_customer_loans"], p["bank_customer_loans"]),
+        )
+        add("bank_credit_loss_to_loans", "Credit Loss Charge / Loans", credit_loss_to_loans, "|Изменение резервов под кредитные убытки| / Средняя чистая ссудная задолженность", metric_status(credit_loss_to_loans, lambda x: x <= 0.02, lambda x: x <= 0.04), "Относительная нагрузка резервов на кредитный портфель")
+        net_interest_to_assets = safe_divide(c["bank_net_interest_income"], average(c["assets"], p["assets"]))
+        add("bank_net_interest_income_to_assets", "Net Interest Income / Assets", net_interest_to_assets, "Чистые процентные доходы / Средние активы", metric_status(net_interest_to_assets, lambda x: x >= 0.04, lambda x: x >= 0.02), "Доходность активов по чистому процентному результату; не является регуляторной NIM")
+        nii_growth = growth(c["bank_net_interest_income"], p["bank_net_interest_income"])
+        add("bank_net_interest_income_growth", "Net Interest Income Growth", nii_growth, "Изменение чистых процентных доходов год к году", metric_status(nii_growth, lambda x: x >= 0.10, lambda x: x >= 0), "Темп роста чистых процентных доходов")
+        fee_growth = growth(c["bank_fee_income"], p["bank_fee_income"])
+        add("bank_fee_income_growth", "Fee Income Growth", fee_growth, "Изменение комиссионных доходов год к году", metric_status(fee_growth, lambda x: x >= 0.08, lambda x: x >= 0), "Темп роста комиссионных доходов")
+        profit_growth = growth(c["net_profit"], p["net_profit"])
+        add("net_profit_growth", "Net Profit Growth", profit_growth, "Изменение чистой прибыли год к году", metric_status(profit_growth, lambda x: x >= 0.10, lambda x: x >= 0), "Темп роста чистой прибыли")
+
+        percent_keys = {
+            "roa", "roe", "equity_ratio", "bank_credit_loss_to_loans",
+            "bank_net_interest_income_to_assets", "bank_net_interest_income_growth",
+            "bank_fee_income_growth", "net_profit_growth",
+        }
+        return [{
+            "key": key,
+            "name": name,
+            "value": value,
+            "display": "—" if value is None else (f"{value * 100:.1f}%" if key in percent_keys else f"{value:,.2f}".replace(",", " ")),
+            "formula": formula,
+            "status": status,
+            "explanation": explanation,
+            "current_year": current_year,
+            "previous_year": previous_year,
+        } for key, name, value, formula, status, explanation in ratio_definitions]
 
     current_ratio = safe_divide(c["current_assets"], c["current_liabilities"])
     add("current_ratio", "Current Ratio", current_ratio, "Оборотные активы / Краткосрочные обязательства", metric_status(current_ratio, lambda x: x >= 1.5, lambda x: x >= 1), "Покрытие краткосрочных обязательств оборотными активами")
@@ -363,8 +436,8 @@ def score_analysis(ratios: list[dict[str, Any]], risk_flags: list[dict[str, Any]
 
 
 SOURCE_PRIORITY = {
+    "bank_ras_coordinate_ocr": 110,
     "ras_coordinate_ocr": 100,
-    "verified_demo": 100,
     "pdf_table": 80,
     "spreadsheet_table": 80,
     "ras_ocr_form": 65,
@@ -375,28 +448,31 @@ SOURCE_PRIORITY = {
 def _plausible_financial_value(value: float, unit: str | None) -> bool:
     """Reject catastrophic OCR concatenations before they reach ratios/UI.
 
-    Russian statutory forms are commonly expressed in thousand rubles. A value
-    above 20 trillion *thousand* rubles is not a plausible single-company line
-    item and almost always means that OCR glued several year columns together.
-    The ruble ceiling is scaled accordingly.
+    Russian statutory forms are commonly expressed in thousand rubles. The
+    ceiling must still accommodate the largest consolidated banks and energy
+    groups; OCR concatenation is primarily rejected by cross-year consistency
+    and accounting identities, not by a small-company magnitude assumption.
     """
     magnitude = abs(value)
     normalized_unit = normalize_label(unit or "")
     if "тыс" in normalized_unit:
-        return magnitude <= 20_000_000_000
+        return magnitude <= 500_000_000_000
     if "млн" in normalized_unit:
-        return magnitude <= 20_000_000
+        return magnitude <= 500_000_000
     if "млрд" in normalized_unit:
-        return magnitude <= 20_000
+        return magnitude <= 500_000
     if "руб" in normalized_unit:
-        return magnitude <= 20_000_000_000_000
-    return magnitude <= 20_000_000_000_000
+        return magnitude <= 500_000_000_000_000
+    return magnitude <= 500_000_000_000_000
 
 
 def _candidate_quality(candidate: dict[str, Any]) -> float:
     source_bonus = {
+        "bank_ras_coordinate_ocr": 0.42,
         "ras_coordinate_ocr": 0.35,
         "ras_ocr_form": 0.15,
+        "ifrs_primary_statement": 0.42,
+        "ifrs_disclosure_note": 0.44,
         "pdf_table": 0.10,
         "spreadsheet": 0.20,
     }.get(str(candidate.get("source_type") or ""), 0.0)
@@ -472,6 +548,12 @@ def merge_financial_candidates(candidates: Iterable[dict[str, Any]]) -> dict[str
         if accepted_any:
             current["source_pages"] = sorted(set(current["source_pages"] + [p for p in candidate.get("source_pages", []) if isinstance(p, int) and p > 0]))
             current["confidence"] = max(current["confidence"], min(1.0, float(candidate.get("confidence", 0.5))))
+            if candidate.get("row_code"):
+                current["row_code"] = candidate["row_code"]
+            if candidate.get("source_row"):
+                current["source_row"] = candidate["source_row"]
+            if candidate.get("provenance"):
+                current["provenance"] = candidate["provenance"]
             if quality >= max((year_quality.get((str(key), y), -1) for y in current["values"]), default=-1):
                 current["source_type"] = candidate.get("source_type") or current.get("source_type")
                 if unit:
@@ -537,15 +619,58 @@ def derive_financial_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, di
     add_sum("liabilities", "Обязательства", "longterm_liabilities", "current_liabilities")
     add_sum("total_debt", "Заемные средства, всего", "longterm_debt_component", "shortterm_debt_component")
 
+    if "current_assets" not in metrics:
+        assets, noncurrent = values("assets"), values("noncurrent_assets")
+        out = {year: assets[year] - noncurrent[year] for year in sorted(set(assets) & set(noncurrent))}
+        add_metric("current_assets", "Оборотные активы", metrics.get("assets", {}).get("unit"), out,
+                   ["assets", "noncurrent_assets"], "Активы − Внеоборотные активы")
+    if "noncurrent_assets" not in metrics:
+        assets, current = values("assets"), values("current_assets")
+        out = {year: assets[year] - current[year] for year in sorted(set(assets) & set(current))}
+        add_metric("noncurrent_assets", "Внеоборотные активы", metrics.get("assets", {}).get("unit"), out,
+                   ["assets", "current_assets"], "Активы − Оборотные активы")
+
+    if "liabilities" not in metrics:
+        assets, equity = values("assets"), values("equity")
+        out = {year: assets[year] - equity[year] for year in sorted(set(assets) & set(equity))}
+        add_metric("liabilities", "Обязательства", metrics.get("assets", {}).get("unit"), out,
+                   ["assets", "equity"], "Активы − Собственный капитал")
+    if "current_liabilities" not in metrics:
+        liabilities, longterm = values("liabilities"), values("longterm_liabilities")
+        out = {year: liabilities[year] - longterm[year] for year in sorted(set(liabilities) & set(longterm))}
+        add_metric("current_liabilities", "Краткосрочные обязательства", metrics.get("liabilities", {}).get("unit"), out,
+                   ["liabilities", "longterm_liabilities"], "Обязательства − Долгосрочные обязательства")
+    if "longterm_liabilities" not in metrics:
+        liabilities, current = values("liabilities"), values("current_liabilities")
+        out = {year: liabilities[year] - current[year] for year in sorted(set(liabilities) & set(current))}
+        add_metric("longterm_liabilities", "Долгосрочные обязательства", metrics.get("liabilities", {}).get("unit"), out,
+                   ["liabilities", "current_liabilities"], "Обязательства − Краткосрочные обязательства")
+
     if "equity" not in metrics:
         assets, liabilities = values("assets"), values("liabilities")
         out = {year: assets[year] - liabilities[year] for year in sorted(set(assets) & set(liabilities))}
         add_metric("equity", "Собственный капитал", metrics.get("assets", {}).get("unit"), out, ["assets", "liabilities"], "Активы − Обязательства")
 
+    if "cash" not in metrics and "cash_end" in metrics:
+        add_metric("cash", "Денежные средства", metrics.get("cash_end", {}).get("unit"), values("cash_end"),
+                   ["cash_end"], "Остаток денежных средств на конец периода")
+
     if "gross_profit" not in metrics:
         revenue, cogs = values("revenue"), values("cogs")
         out = {year: revenue[year] + cogs[year] for year in sorted(set(revenue) & set(cogs))}
         add_metric("gross_profit", "Валовая прибыль", metrics.get("revenue", {}).get("unit"), out, ["revenue", "cogs"], "Выручка + Себестоимость (со знаком минус)")
+
+    if "cogs" not in metrics:
+        revenue, gross = values("revenue"), values("gross_profit")
+        out = {year: gross[year] - revenue[year] for year in sorted(set(revenue) & set(gross))}
+        add_metric("cogs", "Себестоимость продаж", metrics.get("revenue", {}).get("unit"), out,
+                   ["revenue", "gross_profit"], "Валовая прибыль − Выручка")
+
+    if "net_profit" not in metrics:
+        pretax, tax = values("profit_before_tax"), values("income_tax")
+        out = {year: pretax[year] + tax[year] for year in sorted(set(pretax) & set(tax))}
+        add_metric("net_profit", "Чистая прибыль", metrics.get("profit_before_tax", {}).get("unit"), out,
+                   ["profit_before_tax", "income_tax"], "Прибыль до налогообложения + Налог на прибыль")
 
     if "operating_profit" not in metrics:
         gross = values("gross_profit")
@@ -554,6 +679,25 @@ def derive_financial_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, di
         years = sorted(set(gross) & set(commercial) & set(administrative))
         out = {year: gross[year] - abs(commercial[year]) - abs(administrative[year]) for year in years}
         add_metric("operating_profit", "Прибыль от продаж", metrics.get("gross_profit", {}).get("unit"), out, ["gross_profit", "commercial_expenses", "administrative_expenses"], "Валовая прибыль − Коммерческие расходы − Управленческие расходы")
+
+    if "ebitda" not in metrics:
+        operating = values("operating_profit")
+        depreciation = values("depreciation_amortization")
+        years = sorted(set(operating) & set(depreciation))
+        out = {year: operating[year] + abs(depreciation[year]) for year in years}
+        add_metric(
+            "ebitda", "EBITDA", metrics.get("operating_profit", {}).get("unit"), out,
+            ["operating_profit", "depreciation_amortization"],
+            "Операционная прибыль + Амортизация",
+        )
+
+    if "administrative_expenses" not in metrics:
+        gross, commercial, operating = values("gross_profit"), values("commercial_expenses"), values("operating_profit")
+        years = sorted(set(gross) & set(commercial) & set(operating))
+        out = {year: operating[year] - gross[year] - commercial[year] for year in years}
+        add_metric("administrative_expenses", "Управленческие расходы", metrics.get("gross_profit", {}).get("unit"), out,
+                   ["gross_profit", "commercial_expenses", "operating_profit"],
+                   "Прибыль от продаж − Валовая прибыль − Коммерческие расходы")
 
     # The public UI does not need component-only technical rows after total debt
     # has been derived, but the source pages remain attached to the total.
