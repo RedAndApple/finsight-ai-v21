@@ -1,9 +1,11 @@
 services:
   - type: web
-    name: finsight-ai
+    # Keep the v2.1 service separate from the legacy finsight-ai deployment.
+    name: finsight-ai-v21
     runtime: docker
     plan: free
     autoDeploy: true
+    healthCheckPath: /api/health
     envVars:
       - key: AI_BASE_URL
         value: https://openrouter.ai/api/v1
