@@ -1,6 +1,9 @@
 from app.analysis import fallback_analysis
+from app.ocr import remove_table_lines
+from PIL import Image, ImageDraw
 from app.ocr import clean_ocr_text
 from app.parsers import extract_ocr_tables, extract_ras_metrics_from_ocr_lines
+from app.financial import derive_financial_metrics
 
 
 def _word(text, left, width=40, top=100, conf=90):
@@ -84,3 +87,25 @@ def test_fallback_never_uses_raw_ocr_narrative_for_financial_summary():
     assert "наименование показателя" not in combined
     assert "выручка" in combined
     assert "ликвид" in combined
+def test_table_line_removal_preserves_cell_content():
+    image = Image.new("L", (300, 120), 255)
+    draw = ImageDraw.Draw(image)
+    draw.line((0, 20, 299, 20), fill=0, width=2)
+    draw.line((100, 0, 100, 119), fill=0, width=2)
+    draw.rectangle((150, 50, 160, 70), fill=0)
+    cleaned = remove_table_lines(image)
+    assert cleaned.getpixel((50, 20)) == 255
+    assert cleaned.getpixel((100, 90)) == 255
+    assert cleaned.getpixel((155, 60)) == 0
+
+
+def test_missing_statement_rows_are_reconciled_from_verified_subtotals():
+    metrics = {
+        "revenue": {"values": {"2025": 3_453_224_535}, "unit": "тыс. руб.", "confidence": .98},
+        "gross_profit": {"values": {"2025": 1_574_943_507}, "unit": "тыс. руб.", "confidence": .98},
+        "commercial_expenses": {"values": {"2025": -128_102_422}, "unit": "тыс. руб.", "confidence": .98},
+        "operating_profit": {"values": {"2025": 1_383_144_385}, "unit": "тыс. руб.", "confidence": .98},
+    }
+    derived = derive_financial_metrics(metrics)
+    assert derived["cogs"]["values"]["2025"] == -1_878_281_028
+    assert derived["administrative_expenses"]["values"]["2025"] == -63_696_700

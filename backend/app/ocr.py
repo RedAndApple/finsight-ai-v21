@@ -82,6 +82,25 @@ def prepare_ocr_images(image: Image.Image) -> tuple[Image.Image, Image.Image]:
     return gray, binary
 
 
+def remove_table_lines(image: Image.Image) -> Image.Image:
+    """Remove long form borders while preserving digits and Cyrillic strokes.
+
+    Tesseract often treats a bordered RAS cell as an independent text block and
+    consequently loses the current-period value.  Long horizontal/vertical
+    rules are detected by their dark-pixel density and whitened before a
+    dedicated table OCR pass.  This is layout-based and company-independent.
+    """
+    array = np.asarray(image.convert("L"), dtype=np.uint8).copy()
+    dark = array < 128
+    horizontal = np.where(dark.mean(axis=1) > 0.35)[0]
+    vertical = np.where(dark.mean(axis=0) > 0.25)[0]
+    for row in horizontal:
+        array[max(0, row - 2):min(array.shape[0], row + 3), :] = 255
+    for column in vertical:
+        array[:, max(0, column - 2):min(array.shape[1], column + 3)] = 255
+    return Image.fromarray(array, mode="L")
+
+
 def _repair_mixed_alphabet_token(token: str) -> str:
     """Repair Latin lookalikes only inside predominantly Cyrillic tokens."""
     if not re.search(r"[А-Яа-яЁё]", token):
@@ -271,9 +290,40 @@ def recognize_page(image: Image.Image, language: str, form_hint: bool = False) -
     gray, binary = prepare_ocr_images(image)
     candidates: list[OCRResult] = [run_ocr_variant(gray, language, 3, "gray-psm3")]
 
-    if form_hint:
+    # ``form_hint`` only denotes the likely front section of a report. Auditor
+    # covers and explanatory pages must not pay for three full table passes.
+    # Escalate only when the first pass actually sees a statutory form title or
+    # several official RAS row codes. Continuation pages are detected by codes.
+    first_normalized = candidates[0].text.lower().replace("ё", "е")
+    form_titles = (
+        "бухгалтерский баланс", "отчет о финансовых результатах",
+        "отчет о движении денежных средств", "наименование показателя",
+        "отчет о финансовом положении", "отчет о совокупном доходе",
+        "statement of financial position", "statement of profit or loss",
+        "statement of comprehensive income", "statement of cash flows",
+    )
+    ras_codes = set(re.findall(r"(?<!\d)(?:1[1-7]\d0|2[1-5]\d0|4[1-5]\d0)(?!\d)", candidates[0].text))
+    # The old implementation required ``form_hint`` (effectively the first
+    # pages) even when a later page visibly contained a statement title/codes.
+    # That made page 55 use a prose OCR pass.  Content evidence must always win;
+    # the positional hint only makes borderline front-matter pages eligible.
+    detected_form = any(title in first_normalized for title in form_titles) or len(ras_codes) >= 2
+
+    # A contents-derived/native-text hint is stronger than page position.  On
+    # low-contrast forms PSM 3 may miss the title and every row code even though
+    # the page is known to be a statement.  A sparse-text pass is cheap compared
+    # with returning an empty canonical model and gives the table passes a
+    # second chance to see the form evidence.
+    if form_hint and not detected_form and candidates[0].quality < 82:
+        sparse = run_ocr_variant(gray, language, 11, "gray-psm11")
+        candidates.append(sparse)
+        sparse_normalized = sparse.text.lower().replace("ё", "е")
+        sparse_codes = set(re.findall(r"(?<!\d)(?:1[1-7]\d0|2[1-5]\d0|4[1-5]\d0)(?!\d)", sparse.text))
+        detected_form = any(title in sparse_normalized for title in form_titles) or len(sparse_codes) >= 2
+
+    if detected_form or (form_hint and max(item.quality for item in candidates) < 76):
         candidates.append(run_ocr_variant(gray, language, 4, "gray-psm4"))
-        candidates.append(run_ocr_variant(binary, language, 6, "binary-psm6"))
+        candidates.append(run_ocr_variant(remove_table_lines(binary), language, 4, "table-lines-removed-psm4"))
     elif candidates[0].quality < 63:
         candidates.append(run_ocr_variant(gray, language, 4, "gray-psm4"))
         candidates.append(run_ocr_variant(binary, language, 6, "binary-psm6"))
@@ -336,4 +386,3 @@ def recognize_page(image: Image.Image, language: str, form_hint: bool = False) -
         quality=best.quality,
         method="+".join(item.method for item in candidates),
     )
-
